@@ -1,9 +1,10 @@
-package main
+package network
 
 import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"gotor/internal/torrent"
 	"io"
 	"log"
 	"net"
@@ -20,7 +21,10 @@ func NewTrackerClient() *TrackerClient {
 func (tc *TrackerClient) Request(host string, path string, port int) (string, error) {
 	url := fmt.Sprintf("http://%s:%d%s", host, port, path)
 
-	resp, err := http.Get(url)
+	client := &http.Client{}
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", "Transmission/3.00")
+	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("http get error: %v", err)
 		return "", err
@@ -38,29 +42,29 @@ func (tc *TrackerClient) Request(host string, path string, port int) (string, er
 func (tc *TrackerClient) ExtractPeers(bencodeResponse string) ([]Peer, error) {
 	buffer := make([]byte, len(bencodeResponse))
 	copy(buffer, []byte(bencodeResponse))
-	parser, err := NewParserFromData(buffer)
+	parser, err := torrent.NewParserFromData(buffer)
 	if err != nil {
 		log.Printf("NewParserFromData error: %v", err)
 		return nil, err
 	}
 
-	root, err := parser.parse()
+	root, err := parser.Parse()
 	if err != nil {
 		log.Printf("parse error: %v\n", err)
 		return nil, err
 	}
 
-	dict := root.asDict()
+	dict := root.AsDict()
 
 	if _, ok := dict["failure reason"]; ok {
-		return nil, fmt.Errorf("tracker reported error: %s", dict["failure reason"].asString())
+		return nil, fmt.Errorf("tracker reported error: %s", dict["failure reason"].AsString())
 	}
 
 	if _, ok := dict["peers"]; !ok {
 		return nil, errors.New("no peers found in dict")
 	}
 
-	blob := dict["peers"].asString()
+	blob := dict["peers"].AsString()
 	if len(blob)%6 != 0 {
 		log.Println("Warning: peers blob length is not dividable by 6")
 	}

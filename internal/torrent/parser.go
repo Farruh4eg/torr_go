@@ -1,4 +1,4 @@
-package main
+package torrent
 
 import (
 	"errors"
@@ -13,22 +13,22 @@ type Node struct {
 	Value any
 }
 
-func (n Node) asDict() map[string]Node {
+func (n Node) AsDict() map[string]Node {
 	d, _ := n.Value.(map[string]Node)
 	return d
 }
 
-func (n Node) asList() []Node {
+func (n Node) AsList() []Node {
 	d, _ := n.Value.([]Node)
 	return d
 }
 
-func (n Node) asString() string {
+func (n Node) AsString() string {
 	d, _ := n.Value.(string)
 	return d
 }
 
-func (n Node) asInt() int {
+func (n Node) AsInt() int {
 	d, _ := n.Value.(int)
 	return d
 }
@@ -68,7 +68,16 @@ func NewParserFromData(data []byte) (*Parser, error) {
 	return &Parser{buffer: buf}, nil
 }
 
-func (p *Parser) parse() (Node, error) {
+func NewParserFromMagnet(magnet string) (*Parser, error) {
+	// TODO: implement
+	return nil, errors.New("magnet is not yet supported")
+}
+
+func (p *Parser) InfoRaw() string {
+	return p.infoRaw
+}
+
+func (p *Parser) Parse() (Node, error) {
 	if len(p.buffer) == 0 {
 		return Node{}, errors.New("file is empty")
 	}
@@ -208,7 +217,7 @@ func (p *Parser) parseDict() (Node, error) {
 	return Node{Value: dict}, nil
 }
 
-func (p *Parser) printNode(node Node, indent int) {
+func (p *Parser) PrintNode(node Node, indent int) {
 	spaces := strings.Repeat(" ", indent)
 
 	switch v := node.Value.(type) {
@@ -224,14 +233,14 @@ func (p *Parser) printNode(node Node, indent int) {
 		fmt.Printf("List [\n")
 		for _, item := range v {
 			fmt.Printf("%s ", spaces)
-			p.printNode(item, indent+2)
+			p.PrintNode(item, indent+2)
 		}
 		fmt.Printf("%s]\n", spaces)
 	case map[string]Node:
 		fmt.Printf("Dict {\n")
 		for key, value := range v {
 			fmt.Printf("%s %s: ", spaces, key)
-			p.printNode(value, indent+2)
+			p.PrintNode(value, indent+2)
 		}
 		fmt.Printf("%s}\n", spaces)
 	default:

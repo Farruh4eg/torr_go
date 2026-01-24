@@ -1,4 +1,4 @@
-package main
+package pkg
 
 import (
 	"fmt"
@@ -9,9 +9,9 @@ import (
 )
 
 type ParsedUrl struct {
-	host string
-	path string
-	port int
+	Host string
+	Path string
+	Port int
 }
 
 func GeneratePeerId() string {
@@ -55,5 +55,5 @@ func ParseTrackerUrl(trackerUrl string) (ParsedUrl, error) {
 		port, _ = strconv.Atoi(portStr)
 	}
 
-	return ParsedUrl{host: host, path: url.Path, port: port}, nil
+	return ParsedUrl{Host: host, Path: url.Path, Port: port}, nil
 }

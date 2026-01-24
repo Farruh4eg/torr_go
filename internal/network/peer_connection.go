@@ -1,14 +1,17 @@
-package main
+package network
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/sha1"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"gotor/internal/storage"
+	"gotor/internal/torrent"
 	"io"
 	"log"
 	"net"
+	"time"
 )
 
 type MessageID byte
@@ -33,20 +36,20 @@ const (
 )
 
 type Handshake struct {
-	pStrLen  byte
-	pStr     [19]byte
-	reserved [8]byte
-	infoHash [20]byte
-	peerId   [20]byte
+	PStrLen  byte
+	PStr     [19]byte
+	Reserved [8]byte
+	InfoHash [20]byte
+	PeerId   [20]byte
 }
 
 type PeerConnection struct {
-	torrentInfo            TorrentInfo
+	torrentInfo            torrent.TorrentInfo
 	peer                   Peer
 	conn                   net.Conn
 	state                  PeerConnectionState
-	pieceManager           *PieceManager
-	fileManager            *FileManager
+	pieceManager           *storage.PieceManager
+	fileManager            *storage.FileManager
 	targetPipeline         int
 	downloadedBytesInPiece int64
 	currentPiece           int
@@ -57,69 +60,68 @@ type PeerConnection struct {
 	pieceBuffer            []byte
 }
 
-func NewPeerConnection(peer Peer, torrentInfo TorrentInfo, myPeerId string, fileManager *FileManager, pieceManager *PieceManager) *PeerConnection {
+func NewPeerConnection(peer Peer, torrentInfo torrent.TorrentInfo, myPeerId string, fileManager *storage.FileManager, pieceManager *storage.PieceManager) *PeerConnection {
 	pc := &PeerConnection{
 		torrentInfo:    torrentInfo,
 		peer:           peer,
 		myPeerId:       myPeerId,
-		pieceBuffer:    make([]byte, torrentInfo.pieceLength),
+		pieceBuffer:    make([]byte, torrentInfo.PieceLength()),
 		pieceManager:   pieceManager,
 		fileManager:    fileManager,
-		targetPipeline: 10,
+		targetPipeline: 64,
 	}
 
 	return pc
 }
 
-func (pc *PeerConnection) performHandshake() {
+func (pc *PeerConnection) performHandshake() error {
 	// create handshake struct
 	hs := Handshake{
-		pStrLen:  19,
-		reserved: [8]byte{},
-		infoHash: pc.torrentInfo.infoHash,
+		PStrLen:  19,
+		Reserved: [8]byte{},
+		InfoHash: pc.torrentInfo.InfoHash(),
 	}
-	copy(hs.pStr[:], "BitTorrent protocol")
-	copy(hs.peerId[:], pc.myPeerId)
+	copy(hs.PStr[:], "BitTorrent protocol")
+	copy(hs.PeerId[:], pc.myPeerId)
 
-	conn, err := net.Dial("tcp", pc.peer.String())
+	conn, err := net.DialTimeout("tcp", pc.peer.String(), 5*time.Second)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-
 	pc.conn = conn
 
 	err = binary.Write(pc.conn, binary.BigEndian, hs)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	var response Handshake
 	binary.Read(pc.conn, binary.BigEndian, &response)
 
-	if response.pStrLen != 19 {
-		log.Fatalf("Invalid pstrlen: %v\n", err)
+	if response.PStrLen != 19 {
+		return errors.New(fmt.Sprintf("invalid pstrlen: %v\n", response.PStrLen))
 	}
-	if string(response.pStr[:]) != "BitTorrent protocol" {
-		log.Fatalf("Invalid protocol string: %v\n", response.pStr[:])
+	if string(response.PStr[:]) != "BitTorrent protocol" {
+		return errors.New(fmt.Sprintf("invalid protocol string: %v\n", response.PStr[:]))
 	}
-	if response.infoHash != pc.torrentInfo.infoHash {
-		log.Fatalf("Info hash mismatch. Peer has wrong file: %v\n", response.infoHash[:])
+	if response.InfoHash != pc.torrentInfo.InfoHash() {
+		return errors.New(fmt.Sprintf("info hash mismatch. Peer has wrong file: %v\n", response.InfoHash[:]))
 	}
 
-	log.Printf("Handshake ok. Peer ID: %s", response.peerId)
+	log.Printf("Handshake ok. Peer ID: %s", response.PeerId)
+	return nil
 }
 
-func (pc *PeerConnection) runMessageLoop() {
-	interestedMsg := [5]byte{'0', '0', '0', '1', '2'}
+func (pc *PeerConnection) runMessageLoop() error {
+	interestedMsg := [5]byte{0, 0, 0, 1, 2}
 	binary.Write(pc.conn, binary.BigEndian, interestedMsg)
 	log.Println("Sent interested message")
 
-	reader := bufio.NewReader(pc.conn)
 	for {
-		var length int
+		var length int32
 		err := binary.Read(pc.conn, binary.BigEndian, &length)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 
 		if length == 0 {
@@ -127,23 +129,27 @@ func (pc *PeerConnection) runMessageLoop() {
 			continue
 		}
 
-		id, err := reader.ReadByte()
-		if err != nil {
-			log.Fatal(err)
+		idBuf := make([]byte, 1)
+		if _, err := io.ReadFull(pc.conn, idBuf); err != nil {
+			return err
 		}
+		id := idBuf[0]
 
 		var payload []byte
 		if length > 1 && id != 7 {
-			// length minus 1 because length does count the 'id' field, which
-			// is not related to actual payload size
 			payload = make([]byte, length-1)
+			io.ReadFull(pc.conn, payload)
 		}
-
-		log.Printf("Msg: ID=%d Len=%d ", id, length)
+		//log.Printf("Msg: ID=%d Len=%d ", id, length)
 
 		switch MessageID(id) {
 		case MsgChoke:
 			log.Println("Choke")
+			if pc.currentPiece != -1 {
+				pc.pieceManager.MarkAsFailed(pc.currentPiece)
+			}
+			pc.resetState()
+
 		case MsgUnchoke:
 			log.Println("Unchoke")
 			pc.tryRequestNextPiece()
@@ -153,7 +159,8 @@ func (pc *PeerConnection) runMessageLoop() {
 		case MsgNotInterested:
 			log.Println("Not interested")
 		case MsgHave:
-			log.Printf("Have piece #%d\n", payload[0])
+			//pieceIndex := binary.BigEndian.Uint32(payload[:4])
+			//og.Printf("Have piece #%d\n", pieceIndex)
 		case MsgBitfield:
 			log.Printf("Bitfield (%d bytes)\n", len(payload))
 			pc.peerBitfield = make([]bool, len(payload)*8)
@@ -165,61 +172,73 @@ func (pc *PeerConnection) runMessageLoop() {
 				}
 			}
 		case MsgRequest:
-			log.Println("Request")
+			//log.Println("Request")
 		case MsgPiece:
-			log.Println("Piece")
-			pc.HandlePiece(length)
+			//log.Println("Piece")
+			pc.HandlePiece(int(length))
 		case MsgCancel:
 			log.Println("Cancel")
 		default:
 			log.Printf("Unknown id: %d\n", id)
 		}
 	}
+	return nil
 }
 
-func (pc *PeerConnection) Start() {
+func (pc *PeerConnection) Start() error {
 	defer pc.Stop()
-	pc.performHandshake()
-	pc.runMessageLoop()
+	err := pc.performHandshake()
+	if err != nil {
+		return err
+	}
+
+	err = pc.runMessageLoop()
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (pc *PeerConnection) Stop() error {
-	return pc.conn.Close()
+	if pc.conn != nil {
+		return pc.conn.Close()
+	}
+	return nil
 }
 
 func (pc *PeerConnection) RequestBlock(pieceIndex int, blockOffset int, blockLength int) {
 	request := struct {
-		msgLen int
+		msgLen uint32
 		id     byte
-		index  int
-		offset int
-		length int
+		index  uint32
+		offset uint32
+		length uint32
 	}{
 		msgLen: 13,
 		id:     6, // request
-		index:  pieceIndex,
-		offset: blockOffset,
-		length: blockLength,
+		index:  uint32(pieceIndex),
+		offset: uint32(blockOffset),
+		length: uint32(blockLength),
 	}
 
 	binary.Write(pc.conn, binary.BigEndian, request)
-	log.Printf("Sent request: Piece=%d Offset=%d Length=%d\n", pieceIndex, blockOffset, blockLength)
+	//log.Printf("Sent request: Piece=%d Offset=%d Length=%d\n", pieceIndex, blockOffset, blockLength)
 }
 
 func (pc *PeerConnection) HandlePiece(messageLength int) error {
 	if messageLength < 9 {
-		log.Fatalln("Piece message too short")
+		log.Println("piece message too short")
 	}
 
 	header := struct {
-		index uint32
-		begin uint32
+		Index uint32
+		Begin uint32
 	}{}
 
 	err := binary.Read(pc.conn, binary.BigEndian, &header)
 	if err != nil {
-		log.Println("Could not read piece header")
-		return err
+		log.Println("Error reading piece header")
 	}
 
 	blockSize := messageLength - 9
@@ -227,33 +246,35 @@ func (pc *PeerConnection) HandlePiece(messageLength int) error {
 
 	n, err := io.ReadFull(pc.conn, blockData)
 	if err != nil {
-		log.Println("Could not read block data")
-		return err
+		log.Println("Error reading block data")
+
+		pc.pieceManager.MarkAsFailed(pc.currentPiece)
+		pc.resetState()
+		return nil
 	}
 
 	pc.pieceManager.AddBytes(uint64(n))
 
-	if header.begin+uint32(n) > uint32(len(pc.pieceBuffer)) {
-		return errors.New("buffer overflow. Peer sent too much data")
+	if header.Begin+uint32(n) > uint32(len(pc.pieceBuffer)) {
+		log.Println("Buffer overflow")
 	}
 
-	copy(pc.pieceBuffer[header.begin:], blockData)
+	copy(pc.pieceBuffer[header.Begin:], blockData)
 
 	pc.inFlight--
 	pc.downloadedBytesInPiece += int64(len(blockData))
 
-	if pc.downloadedBytesInPiece >= pc.torrentInfo.pieceLength {
+	if pc.downloadedBytesInPiece >= pc.torrentInfo.PieceLength() {
 		log.Printf("Piece %d downloaded. Verifying\n", pc.currentPiece)
 
 		if pc.verifyPiece(pc.currentPiece) {
 			log.Println("Hash match. Writing to disk")
 
-			globalOffset := int64(pc.currentPiece) * pc.torrentInfo.pieceLength
+			globalOffset := int64(pc.currentPiece) * pc.torrentInfo.PieceLength()
 			pc.fileManager.Write(globalOffset, pc.pieceBuffer)
 			pc.pieceManager.MarkAsCompleted(pc.currentPiece)
 		} else {
 			log.Printf("Hash mismatch. Dropping piece %d\n", pc.currentPiece)
-			return err
 		}
 
 		pc.state = Idle
@@ -274,16 +295,20 @@ func (pc *PeerConnection) verifyPiece(index int) bool {
 	calculatedHash := sha1.Sum(pc.pieceBuffer)
 
 	offset := index * 20
-	if offset+20 > len(pc.torrentInfo.pieces) {
+	if offset+20 > len(pc.torrentInfo.Pieces()) {
 		return false
 	}
 
-	expectedHash := pc.torrentInfo.pieces[offset : offset+20]
+	expectedHash := pc.torrentInfo.Pieces()[offset : offset+20]
 
 	return bytes.Equal(calculatedHash[:], []byte(expectedHash))
 }
 
 func (pc *PeerConnection) tryRequestNextPiece() {
+	if len(pc.peerBitfield) == 0 {
+		return
+	}
+
 	if pc.state == Downloading {
 		return
 	}
@@ -306,16 +331,27 @@ func (pc *PeerConnection) tryRequestNextPiece() {
 
 func (pc *PeerConnection) FillPipeline() {
 	for pc.inFlight < pc.targetPipeline {
-		if int64(pc.currentOffset) >= pc.torrentInfo.pieceLength {
+		if int64(pc.currentOffset) >= pc.torrentInfo.PieceLength() {
 			break
 		}
 
-		bytesLeft := pc.torrentInfo.pieceLength - int64(pc.currentOffset)
+		bytesLeft := pc.torrentInfo.PieceLength() - int64(pc.currentOffset)
 		size := min(16*1024, bytesLeft)
 
 		// those int type conversions are killing me man
 		// what was I thinking
 		pc.RequestBlock(pc.currentPiece, pc.currentOffset, int(size))
+
+		pc.currentOffset += int(size)
 		pc.inFlight++
 	}
+}
+
+func (pc *PeerConnection) resetState() {
+	pc.state = Idle
+	pc.inFlight = 0
+	pc.currentPiece = -1
+	pc.currentOffset = 0
+	pc.downloadedBytesInPiece = 0
+	clear(pc.pieceBuffer)
 }
